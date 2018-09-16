@@ -593,7 +593,7 @@ a:visited{
 	
 	.boxes {
 		position: relative;
-		width: 90%;
+		width: 100%;
 		margin-left: 5%;
 		margin-bottom: 10%;
 		display: -webkit-flex;
