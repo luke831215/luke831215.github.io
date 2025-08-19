@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mr.Oops!!</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // ===== SHARED HELPER COMPONENTS =====
+
+    function StickFigure({ className, isCharred }) {
+      const color = isCharred ? '#404040' : 'currentColor';
+      const headFill = isCharred ? '#555555' : 'white';
+      return React.createElement('svg', { className: className, viewBox: "0 0 24 24", stroke: color, strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" },
+        React.createElement('circle', { cx: "12", cy: "8", r: "6", fill: headFill }),
+        React.createElement('line', { x1: "12", y1: "14", x2: "12", y2: "19" }),
+        React.createElement('path', { d: "M 12 15 A 6 6 0 0 0 6 17" }),
+        React.createElement('path', { d: "M 12 15 A 6 6 0 0 1 18 17" }),
+        React.createElement('path', { d: "M 12 19 A 6 6 0 0 0 8 22" }),
+        React.createElement('path', { d: "M 12 19 A 6 6 0 0 1 16 22" })
+      );
+    }
+    
+    function GameOverlay({ children }) {
+      return React.createElement('div', { 
+        className: "absolute inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center text-slate-100 z-50" 
+      }, React.createElement('div', { className: "p-8 rounded-3xl bg-slate-900/90 border border-slate-800 shadow-2xl" }, children));
+    }
+
+
+    // ===== LEVEL 1: Rock Game =====
+    function RockGame({ onGameOver }) {
+      const GRID_COLS = 6;
+      const GRID_ROWS = 6;
+      const CELL_PX = 90;
+      const WARNING_TIME_MS = 800;
+      const BLINK_PERIOD_MS = 300;
+      const SWEEP_SPEED_CELLS_PER_SEC = 4.5;
+      const BASE_SPAWN_INTERVAL = 1.65;
+
+      const [running, setRunning] = useState(true);
+      const [isDying, setIsDying] = useState(false);
+      const [waveCount, setWaveCount] = useState(0);
+      const [renderTick, setRenderTick] = useState(0);
+
+      const playerRef = useRef({ x: Math.floor(GRID_COLS / 2), y: Math.floor(GRID_ROWS / 2) });
+      const telegraphsRef = useRef([]);
+      const firesRef = useRef([]);
+      const lastTsRef = useRef(0);
+      const elapsedRef = useRef(0);
+      const spawnTimerRef = useRef(0);
+
+      useEffect(() => {
+        const kd = (e) => {
+          if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "w", "a", "s", "d"].includes(e.key)) {
+            e.preventDefault();
+            if (running && !isDying) {
+              const moveIntent = getMoveIntentFromKey(e.key);
+              if (moveIntent.dx !== 0 || moveIntent.dy !== 0) executeMove(moveIntent);
+            }
+          }
+        };
+        window.addEventListener("keydown", kd);
+        return () => window.removeEventListener("keydown", kd);
+      }, [running, isDying]);
+
+      useEffect(() => {
+        let raf;
+        const loop = (ts) => {
+          raf = requestAnimationFrame(loop);
+          if (!running) { lastTsRef.current = ts; return; }
+          if (!lastTsRef.current) lastTsRef.current = ts;
+          const dt = Math.min(0.033, (ts - lastTsRef.current) / 1000);
+          lastTsRef.current = ts;
+          if (!isDying) elapsedRef.current += dt;
+          
+          const spawnInterval = getSpawnIntervalByWave(waveCount);
+          spawnTimerRef.current += dt;
+          if (spawnTimerRef.current >= spawnInterval) {
+            spawnTimerRef.current = 0;
+            spawnPattern();
+          }
+
+          const now = performance.now();
+          for (let i = telegraphsRef.current.length - 1; i >= 0; i--) {
+            const tg = telegraphsRef.current[i];
+            if (now >= tg.fireAt) {
+              telegraphsRef.current.splice(i, 1);
+              firesRef.current.push({ id: tg.id, dir: tg.dir, lane: tg.lane, startTime: now, position: 0 });
+            }
+          }
+
+          for (let i = firesRef.current.length - 1; i >= 0; i--) {
+            const tr = firesRef.current[i];
+            const timeElapsed = (now - tr.startTime) / 1000;
+            tr.position = SWEEP_SPEED_CELLS_PER_SEC * timeElapsed;
+            if (!isDying && checkTrapHit(tr)) onDeath();
+            if (isTrapDone(tr)) firesRef.current.splice(i, 1);
+          }
+          setRenderTick(t => t + 1);
+        };
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+      }, [running, isDying, waveCount]);
+
+      const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+      const getSpawnIntervalByWave = (wc) => {
+        let multiplier = 1.0;
+        if (wc > 10) multiplier *= 0.8; if (wc > 25) multiplier *= 0.85; if (wc > 50) multiplier *= 0.85; if (wc > 75) multiplier *= 0.85; if (wc > 100) multiplier *= 0.85; if (wc > 150) multiplier *= 0.9; if (wc > 200) multiplier *= 0.95;
+        return Math.max(0.40, BASE_SPAWN_INTERVAL * multiplier);
+      };
+      const getMoveIntentFromKey = (key) => {
+        if (key === "ArrowUp" || key === "w") return { dx: 0, dy: -1 }; if (key === "ArrowDown" || key === "s") return { dx: 0, dy: 1 }; if (key === "ArrowLeft" || key === "a") return { dx: -1, dy: 0 }; if (key === "ArrowRight" || key === "d") return { dx: 1, dy: 0 }; return { dx: 0, dy: 0 };
+      };
+      const executeMove = (moveIntent) => { const { dx, dy } = moveIntent; if (dx === 0 && dy === 0) return; const p = playerRef.current; p.x = clamp(p.x + dx, 0, GRID_COLS - 1); p.y = clamp(p.y + dy, 0, GRID_ROWS - 1); };
+      
+      const onDeath = () => {
+        if (isDying) return;
+        setIsDying(true);
+        const finalWaveCount = waveCount;
+        setTimeout(() => {
+          onGameOver(finalWaveCount);
+        }, 3000);
+      };
+      
+      const spawnPattern = () => {
+          setWaveCount(c => c + 1);
+
+          // BUG FIX: Corrected weapon direction generation logic
+          const trapCount = Math.floor(Math.random() * 4) + 2;
+          const usedCombos = new Set();
+          
+          for (let i = 0; i < trapCount; i++) {
+              let dir, lane, combo, oppositeCombo, tries = 0;
+              
+              // Keep trying until we find a valid, non-conflicting spot
+              while (tries < 20) {
+                  tries++;
+                  
+                  dir = Math.floor(Math.random() * 4);
+                  const maxLane = (dir % 2 === 0) ? GRID_COLS : GRID_ROWS;
+                  lane = Math.floor(Math.random() * maxLane);
+
+                  combo = `${dir}:${lane}`;
+                  const oppositeDir = dir ^ 2;
+                  oppositeCombo = `${oppositeDir}:${lane}`;
+
+                  // Conflict if this spot OR its direct opposite is already taken
+                  if (!usedCombos.has(combo) && !usedCombos.has(oppositeCombo)) {
+                      usedCombos.add(combo);
+                      scheduleTelegraph(dir, lane);
+                      break; 
+                  }
+              }
+          }
+      };
+
+      const scheduleTelegraph = (dir, lane) => { const now = performance.now(); telegraphsRef.current.push({ id: randomId(), dir, lane, t0: now, fireAt: now + WARNING_TIME_MS }); };
+      const randomId = () => Math.random().toString(36).slice(2);
+      const trapHeadXY = (tr) => { if (tr.dir === 0) return { x: tr.lane, y: Math.floor(tr.position) }; if (tr.dir === 2) return { x: tr.lane, y: GRID_ROWS - 1 - Math.floor(tr.position) }; if (tr.dir === 3) return { x: Math.floor(tr.position), y: tr.lane }; if (tr.dir === 1) return { x: GRID_COLS - 1 - Math.floor(tr.position), y: tr.lane }; return { x: 0, y: 0 }; };
+      const isTrapDone = (tr) => tr.position > Math.max(GRID_COLS, GRID_ROWS) + 2;
+      const checkTrapHit = (tr) => { const head = trapHeadXY(tr); const p = playerRef.current; return (head.x === p.x && head.y === p.y && head.x >= 0 && head.x < GRID_COLS && head.y >= 0 && head.y < GRID_ROWS); };
+      
+      const gridStyle = { width: GRID_COLS * CELL_PX, height: GRID_ROWS * CELL_PX, gridTemplateColumns: `repeat(${GRID_COLS}, ${CELL_PX}px)`, gridTemplateRows: `repeat(${GRID_ROWS}, ${CELL_PX}px)`};
+      const now = performance.now();
+      const blinkOn = (t0) => ((now - t0) % BLINK_PERIOD_MS) < BLINK_PERIOD_MS / 2;
+
+      const edgeIndicatorElements = (running || isDying) ? telegraphsRef.current.map((tg, idx) => {
+        if (!blinkOn(tg.t0)) return null;
+        let style = {}; const orangeYellow = '#fb923c';
+        if (tg.dir === 0) style = { position: 'absolute',top: '4px', left: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: `${CELL_PX/2}px`,height: '12px',backgroundColor: orangeYellow,borderRadius: '0 0 6px 6px'};
+        else if (tg.dir === 2) style = { position: 'absolute',bottom: '4px', left: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: `${CELL_PX/2}px`,height: '12px',backgroundColor: orangeYellow,borderRadius: '6px 6px 0 0'};
+        else if (tg.dir === 3) style = { position: 'absolute',left: '4px',top: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: '12px',height: `${CELL_PX/2}px`,backgroundColor: orangeYellow,borderRadius: '0 6px 6px 0'};
+        else if (tg.dir === 1) style = { position: 'absolute',right: '4px',top: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: '12px',height: `${CELL_PX/2}px`,backgroundColor: orangeYellow,borderRadius: '6px 0 0 6px'};
+        return React.createElement('div', { key: `indicator-${tg.id || idx}`, style, className: "shadow-lg" });
+      }).filter(Boolean) : [];
+      
+      const trapElements = (running || isDying) ? firesRef.current.map(tr => {
+        let x, y;
+        if (tr.dir === 0) { x = tr.lane; y = tr.position; } else if (tr.dir === 2) { x = tr.lane; y = GRID_ROWS - 1 - tr.position; } else if (tr.dir === 3) { x = tr.position; y = tr.lane; } else if (tr.dir === 1) { x = GRID_COLS - 1 - tr.position; y = tr.lane; }
+        if (x < -1 || x > GRID_COLS || y < -1 || y > GRID_ROWS) return null;
+        const pixelX = x * CELL_PX + CELL_PX / 2, pixelY = y * CELL_PX + CELL_PX / 2, size = CELL_PX * 0.8;
+        const scrollDistance = tr.position * 40;
+        let bgPosX = 0, bgPosY = 0;
+        if (tr.dir === 0) bgPosY = scrollDistance; else if (tr.dir === 2) bgPosY = -scrollDistance; else if (tr.dir === 3) bgPosX = scrollDistance; else if (tr.dir === 1) bgPosX = -scrollDistance;
+        const ballContainerStyle = { position: 'absolute', left: `${pixelX - size/2}px`, top: `${pixelY - size/2}px`, width: `${size}px`, height: `${size}px`, borderRadius: '50%', background: `radial-gradient(circle at 30% 30%, #EAE0D1, #A06A3E 65%, #4A3426 100%)`, boxShadow: `inset 5px 5px 10px rgba(0, 0, 0, 0.3), inset -3px -3px 8px rgba(255, 245, 230, 0.4)`, zIndex: 20, overflow: 'hidden', filter: 'drop-shadow(0px 12px 10px rgba(0, 0, 0, 0.35))' };
+        const patternStyle = { position: 'absolute', inset: 0, borderRadius: 'inherit', backgroundImage: `radial-gradient(circle at 20% 80%, rgba(40, 20, 10, 0.25) 15%, transparent 40%), radial-gradient(circle at 75% 30%, rgba(50, 30, 20, 0.2) 20%, transparent 50%)`, backgroundSize: '150px 150px', backgroundRepeat: 'repeat', backgroundPosition: `${bgPosX}px ${bgPosY}px`, mixBlendMode: 'multiply', opacity: 0.8 };
+        return React.createElement('div', { key: tr.id, style: ballContainerStyle }, React.createElement('div', { style: patternStyle }));
+      }).filter(Boolean) : [];
+      
+      const playerElement = (running || isDying) && React.createElement('div', { style: { position: 'absolute', left: `${playerRef.current.x * CELL_PX}px`, top: `${playerRef.current.y * CELL_PX}px`, width: `${CELL_PX}px`, height: `${CELL_PX}px`, zIndex: 10, transition: 'left 100ms linear, top 100ms linear, transform 150ms ease-out', transform: isDying ? 'scaleY(0.25) translateY(75%)' : 'none', transformOrigin: 'bottom' } }, React.createElement(StickFigure, { className: "w-full h-full text-black" }));
+
+      return React.createElement('div', null,
+          React.createElement('header', { className: "mb-4 flex items-center justify-between w-full", style: { maxWidth: gridStyle.width + 40 } }, 
+            React.createElement('h1', { className: "text-2xl md:text-3xl font-bold tracking-tight" }, "Mr.Oops!! - Rock"),
+          ),
+          React.createElement('div', { className: "relative rounded-2xl overflow-hidden shadow-xl border border-slate-800", style: { width: gridStyle.width + 40, height: gridStyle.height + 40, padding: '20px' } },
+            ...edgeIndicatorElements,
+            React.createElement('div', { className: "absolute inset-5 grid", style: gridStyle }, [...Array(GRID_ROWS * GRID_COLS)].map((_, i) => React.createElement('div', { key: `cell-${i}`, className: `border border-gray-300 bg-white`, style: { width: CELL_PX, height: CELL_PX } }))),
+            React.createElement('div', { className: "absolute", style: { top: '20px', left: '20px', width: gridStyle.width, height: gridStyle.height } }, playerElement, ...trapElements)
+          )
+      );
+    }
+
+    // ===== LEVEL 2: Iron Game =====
+    function IronGame({ onGameOver }) {
+      const GRID_COLS = 6, GRID_ROWS = 6, CELL_PX = 90, PLAYER_DEATH_ANIMATION_MS = 4000, GAMEOVER_DELAY_MS = 3000, BLINK_PERIOD_MS = 300, BASE_SPAWN_INTERVAL = 2.0, BASE_SPEED = 11.0, BASE_WARNING_TIME_MS = 800;
+
+      const [running, setRunning] = useState(true);
+      const [isDying, setIsDying] = useState(false);
+      const [waveCount, setWaveCount] = useState(0);
+      const [renderTick, setRenderTick] = useState(0);
+      const [currentSpeed, setCurrentSpeed] = useState(BASE_SPEED);
+      const [currentWarningTime, setCurrentWarningTime] = useState(BASE_WARNING_TIME_MS);
+
+      const playerRef = useRef({ x: Math.floor(GRID_COLS / 2), y: Math.floor(GRID_ROWS / 2) });
+      const deathInfoRef = useRef(null);
+      const telegraphsRef = useRef([]);
+      const firesRef = useRef([]);
+      const lastTsRef = useRef(0);
+      const elapsedRef = useRef(0);
+      const spawnTimerRef = useRef(0);
+      const specialPatternStateRef = useRef({ side: null, wavesLeft: 0 });
+
+      useEffect(() => {
+        const kd = (e) => {
+          if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "w", "a", "s", "d"].includes(e.key)) {
+            e.preventDefault();
+            if (running && !isDying) {
+              const moveIntent = getMoveIntentFromKey(e.key);
+              if (moveIntent.dx !== 0 || moveIntent.dy !== 0) executeMove(moveIntent);
+            }
+          }
+        };
+        window.addEventListener("keydown", kd);
+        return () => window.removeEventListener("keydown", kd);
+      }, [running, isDying]);
+
+      useEffect(() => { if (waveCount > 0 && waveCount % 5 === 0) { const newSpeed = Math.random() * (16.0 - 9) + 9; setCurrentSpeed(newSpeed); const newWarningTime = BASE_WARNING_TIME_MS * (BASE_SPEED / newSpeed); setCurrentWarningTime(newWarningTime); } }, [waveCount]);
+      
+      useEffect(() => {
+        let raf;
+        const loop = (ts) => {
+          raf = requestAnimationFrame(loop);
+          if (!lastTsRef.current) lastTsRef.current = ts;
+          const dt = Math.min(0.033, (ts - lastTsRef.current) / 1000);
+          lastTsRef.current = ts;
+
+          if (running) {
+            elapsedRef.current += dt;
+            const spawnInterval = getSpawnIntervalByWave(waveCount, currentSpeed);
+            const now = performance.now();
+            spawnTimerRef.current += dt;
+            if (spawnTimerRef.current >= spawnInterval) { spawnTimerRef.current = 0; spawnPattern(); }
+            for (let i = telegraphsRef.current.length - 1; i >= 0; i--) { const tg = telegraphsRef.current[i]; if (now >= tg.fireAt) { telegraphsRef.current.splice(i, 1); firesRef.current.push({ id: tg.id, dir: tg.dir, lane: tg.lane, startTime: now, position: 0, speed: tg.speed }); } }
+            for (let i = firesRef.current.length - 1; i >= 0; i--) {
+              const tr = firesRef.current[i];
+              const speedToUse = tr.speed || currentSpeed;
+              tr.position = speedToUse * ((now - tr.startTime) / 1000);
+              if (!isDying && checkTrapHit(tr)) onDeath(tr);
+              if (isTrapDone(tr)) firesRef.current.splice(i, 1);
+            }
+          }
+          setRenderTick(t => t + 1);
+        };
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+      }, [running, isDying, waveCount, currentSpeed]);
+
+      const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+      const getSpawnIntervalByWave = (wc, speed) => { const specialWaveMod = wc % 25; if (specialWaveMod === 21) return 1.85; if (specialWaveMod >= 22 && specialWaveMod <= 24) return 0.75; let waveMultiplier = 1.0; if (wc > 10) waveMultiplier *= 0.7; if (wc > 50) waveMultiplier *= 0.75; if (wc > 100) waveMultiplier *= 0.8; if (wc > 150) waveMultiplier *= 0.85; if (wc > 200) waveMultiplier *= 0.85; const speedMultiplier = BASE_SPEED / speed; let interval = BASE_SPAWN_INTERVAL * waveMultiplier * speedMultiplier; if ((wc + 1) % 5 === 0 && wc > 0) interval += 0.4; return Math.max(0.4, interval); };
+      const getMoveIntentFromKey = (key) => { if (key === "ArrowUp" || key === "w") return { dx: 0, dy: -1 }; if (key === "ArrowDown" || key === "s") return { dx: 0, dy: 1 }; if (key === "ArrowLeft" || key === "a") return { dx: -1, dy: 0 }; if (key === "ArrowRight" || key === "d") return { dx: 1, dy: 0 }; return { dx: 0, dy: 0 }; };
+      const executeMove = (moveIntent) => { const p = playerRef.current; p.x = clamp(p.x + moveIntent.dx, 0, GRID_COLS - 1); p.y = clamp(p.y + moveIntent.dy, 0, GRID_ROWS - 1); };
+
+      const onDeath = (hitTrap) => {
+        if (isDying) return;
+        deathInfoRef.current = { direction: hitTrap.dir, px: playerRef.current.x, py: playerRef.current.y, wave: waveCount };
+        setIsDying(true);
+        setTimeout(() => {
+          onGameOver(deathInfoRef.current.wave);
+        }, GAMEOVER_DELAY_MS);
+      };
+      
+      const spawnPattern = () => {
+          const nextWave = waveCount + 1;
+          if (nextWave > 20 && (nextWave % 25 === 21)) {
+              specialPatternStateRef.current = { side: Math.floor(Math.random() * 4), wavesLeft: 5 };
+          }
+          if (specialPatternStateRef.current.wavesLeft > 0) {
+              setWaveCount(c => c + 1);
+              const { side, wavesLeft } = specialPatternStateRef.current; const isFirstWaveOfSequence = wavesLeft === 5; const warningTime = 650 + (isFirstWaveOfSequence ? 1000 : 0); const speed = 14; const maxLane = (side % 2 === 0) ? GRID_COLS : GRID_ROWS; const usedLanes = new Set(); const trapCount = 4;
+              for (let i = 0; i < trapCount; i++) { let lane, tries = 0; do { lane = Math.floor(Math.random() * maxLane); tries++; } while (usedLanes.has(lane) && tries < 10); if (!usedLanes.has(lane)) { usedLanes.add(lane); scheduleTelegraph(side, lane, { warningTime, speed }); } }
+              specialPatternStateRef.current.wavesLeft--; return;
+          }
+          setWaveCount(c => c + 1);
+          
+          // BUG FIX: Corrected weapon direction generation logic
+          const trapCount = Math.floor(Math.random() * 4) + 2;
+          const usedCombos = new Set();
+          
+          for (let i = 0; i < trapCount; i++) {
+              let dir, lane, combo, oppositeCombo, tries = 0;
+              
+              while (tries < 20) {
+                  tries++;
+                  
+                  dir = Math.floor(Math.random() * 4);
+                  const maxLane = (dir % 2 === 0) ? GRID_COLS : GRID_ROWS;
+                  lane = Math.floor(Math.random() * maxLane);
+
+                  combo = `${dir}:${lane}`;
+                  const oppositeDir = dir ^ 2;
+                  oppositeCombo = `${oppositeDir}:${lane}`;
+
+                  if (!usedCombos.has(combo) && !usedCombos.has(oppositeCombo)) {
+                      usedCombos.add(combo);
+                      scheduleTelegraph(dir, lane);
+                      break;
+                  }
+              }
+          }
+      };
+
+      const scheduleTelegraph = (dir, lane, overrides = {}) => { const now = performance.now(); const id = randomId(); const warning = overrides.warningTime || currentWarningTime; const speed = overrides.speed || currentSpeed; telegraphsRef.current.push({ id, dir, lane, t0: now, fireAt: now + warning, speed: speed }); };
+      const randomId = () => Math.random().toString(36).slice(2);
+      const trapHeadXY = (tr) => { if (tr.dir === 0) return { x: tr.lane, y: Math.floor(tr.position) }; if (tr.dir === 2) return { x: tr.lane, y: GRID_ROWS - 1 - Math.floor(tr.position) }; if (tr.dir === 3) return { x: Math.floor(tr.position), y: tr.lane }; if (tr.dir === 1) return { x: GRID_COLS - 1 - Math.floor(tr.position), y: tr.lane }; return { x: 0, y: 0 }; };
+      const isTrapDone = (tr) => tr.position > Math.max(GRID_COLS, GRID_ROWS) + 2;
+      const checkTrapHit = (tr) => { const head = trapHeadXY(tr); const p = playerRef.current; return (head.x === p.x && head.y === p.y && head.x >= 0 && head.x < GRID_COLS && head.y >= 0 && head.y < GRID_ROWS); };
+      
+      const gridStyle = { width: GRID_COLS * CELL_PX, height: GRID_ROWS * CELL_PX, gridTemplateColumns: `repeat(${GRID_COLS}, ${CELL_PX}px)`, gridTemplateRows: `repeat(${GRID_ROWS}, ${CELL_PX}px)` };
+      const now = performance.now();
+      const blinkOn = (t0) => ((now - t0) % BLINK_PERIOD_MS) < BLINK_PERIOD_MS / 2;
+
+      const edgeIndicatorElements = running ? telegraphsRef.current.map(tg => {
+        if (!blinkOn(tg.t0)) return null; let style = {}; const orangeYellow = '#fb923c'; 
+        // BUG FIX: Corrected borderRadius for dir === 1
+        if (tg.dir === 0) style = { position: 'absolute',top: '4px', left: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: `${CELL_PX/2}px`,height: '12px',backgroundColor: orangeYellow,borderRadius: '0 0 6px 6px'}; 
+        else if (tg.dir === 2) style = { position: 'absolute',bottom: '4px', left: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: `${CELL_PX/2}px`,height: '12px',backgroundColor: orangeYellow,borderRadius: '6px 6px 0 0'}; 
+        else if (tg.dir === 3) style = { position: 'absolute',left: '4px',top: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: '12px',height: `${CELL_PX/2}px`,backgroundColor: orangeYellow,borderRadius: '0 6px 6px 0'}; 
+        else if (tg.dir === 1) style = { position: 'absolute',right: '4px',top: `${20 + tg.lane * CELL_PX + CELL_PX/4}px`,width: '12px',height: `${CELL_PX/2}px`,backgroundColor: orangeYellow,borderRadius: '6px 0 0 6px'};
+        return React.createElement('div', { key: `indicator-${tg.id}`, style, className: "shadow-lg" });
+      }).filter(Boolean) : [];
+      
+      const trapElements = running ? firesRef.current.map(tr => {
+        let x, y; if (tr.dir === 0) { x = tr.lane; y = tr.position;} else if (tr.dir === 2) { x = tr.lane; y = GRID_ROWS - 1 - tr.position;} else if (tr.dir === 3) { x = tr.position; y = tr.lane;} else if (tr.dir === 1) { x = GRID_COLS - 1 - tr.position; y = tr.lane;} if (x < -1 || x > GRID_COLS || y < -1 || y > GRID_ROWS) return null; const pixelX = x * CELL_PX + CELL_PX / 2; const pixelY = y * CELL_PX + CELL_PX / 2; const size = CELL_PX * 0.7; const ballContainerStyle = { position: 'absolute', left: `${pixelX-size/2}px`, top: `${pixelY-size/2}px`, width: `${size}px`, height: `${size}px`, borderRadius: '50%', background: `radial-gradient(circle at 35% 35%, white 1%, #ccc 8%, #111 25%, black 60%)`, boxShadow: `3px 3px 5px rgba(0,0,0,0.3)`, zIndex: 20 }; return React.createElement('div', { key: tr.id, style: ballContainerStyle });
+      }).filter(Boolean) : [];
+      
+      const playerStyle = useMemo(() => ({ position: 'absolute', left: `${playerRef.current.x * CELL_PX}px`, top: `${playerRef.current.y * CELL_PX}px`, width: `${CELL_PX}px`, height: `${CELL_PX}px`, zIndex: 10, transition: 'left 100ms linear, top 100ms linear, opacity 300ms ease-in-out' }), [playerRef.current.x, playerRef.current.y]);
+      const dyingPlayerStyle = useMemo(() => { if (!isDying || !deathInfoRef.current) return {}; const { direction, px, py } = deathInfoRef.current; const flyDistance = Math.max(gridStyle.width, gridStyle.height) * 1.5; let transform = ''; if (direction === 0) transform = `translateY(${flyDistance}px)`; if (direction === 2) transform = `translateY(-${flyDistance}px)`; if (direction === 3) transform = `translateX(${flyDistance}px)`; if (direction === 1) transform = `translateX(-${flyDistance}px)`; return { left: `${px * CELL_PX}px`, top: `${py * CELL_PX}px`, transform: `${transform} rotate(720deg) scale(0.5)`, transition: `transform ${PLAYER_DEATH_ANIMATION_MS}ms cubic-bezier(0.4, 0, 1, 1)` }; }, [isDying]);
+      const finalPlayerStyle = { ...playerStyle, ...dyingPlayerStyle, opacity: running ? 1 : 0 };
+      const playerElement = React.createElement('div', { style: finalPlayerStyle }, React.createElement(StickFigure, { className: "w-full h-full text-black" }));
+
+      return React.createElement('div', null, 
+          React.createElement('header', { className: "mb-4 flex items-center justify-between w-full", style: { maxWidth: gridStyle.width + 40 } }, 
+            React.createElement('h1', { className: "text-2xl md:text-3xl font-bold tracking-tight" }, "Mr.Oops!! - Iron")),
+          React.createElement('div', { className: "relative rounded-2xl overflow-hidden shadow-xl border border-slate-800", style: { width: gridStyle.width + 40, height: gridStyle.height + 40, padding: '20px' } },
+            ...edgeIndicatorElements,
+            React.createElement('div', { className: "absolute inset-5 grid", style: gridStyle }, [...Array(GRID_ROWS*GRID_COLS)].map((_,i) => React.createElement('div', { key: `cell-${i}`, className: `border border-gray-300 bg-white`, style: { width: CELL_PX, height: CELL_PX } }))),
+            React.createElement('div', { className: "absolute", style: { top: '20px', left: '20px', width: gridStyle.width, height: gridStyle.height } }, playerElement, ...trapElements)
+          )
+      );
+    }
+    
+    function DeathAnimation({ playerPos, cellPx, onAnimationEnd }) {
+      const ANIMATION_DURATION_MS = 4000;
+      const PARTICLE_COUNT = 60;
+      const [particles, setParticles] = useState([]);
+
+      useEffect(() => {
+        const newParticles = Array.from({ length: PARTICLE_COUNT }).map((_, i) => ({ id: i, x: Math.random() * cellPx * 0.8 + cellPx * 0.1, y: Math.random() * cellPx * 0.8 + cellPx * 0.1, size: Math.random() * 4 + 2, delay: Math.random() * (ANIMATION_DURATION_MS / 2000), duration: Math.random() * 2 + 2 }));
+        setParticles(newParticles);
+        const timer = setTimeout(onAnimationEnd, ANIMATION_DURATION_MS);
+        return () => clearTimeout(timer);
+      }, []);
+
+      const animationCss = ` @keyframes ash-fall { from { transform: translateY(0); opacity: 1; } to { transform: translateY(100px); opacity: 0; } } @keyframes char-fade-out { 0% { opacity: 1; transform: scale(1); } 70% { opacity: 0.8; transform: scale(1.05); } 100% { opacity: 0; transform: scale(0.9); } }`;
+
+      return React.createElement(React.Fragment, null,
+        React.createElement('style', null, animationCss),
+        React.createElement('div', { style: { position: 'absolute', left: `${playerPos.x * cellPx}px`, top: `${playerPos.y * cellPx}px`, width: `${cellPx}px`, height: `${cellPx}px`, zIndex: 15 }},
+        React.createElement('div', { className: "w-full h-full", style: { animation: `char-fade-out ${ANIMATION_DURATION_MS/1000}s ease-out forwards` } }, React.createElement(StickFigure, { className: "w-full h-full", isCharred: true })),
+        ...particles.map(p => React.createElement('div', { key: p.id, style: { position: 'absolute', left: `${p.x}px`, top: `${p.y}px`, width: `${p.size}px`, height: `${p.size}px`, backgroundColor: '#333', borderRadius: '50%', opacity: 0, animation: `ash-fall ${p.duration}s ease-in ${p.delay}s forwards` }}))
+      ));
+    }
+
+    // ===== LEVEL 3: Laser Game =====
+    function LaserGame({ onGameOver }) {
+      const GRID_COLS = 6, GRID_ROWS = 6, CELL_PX = 90, BASE_LASER_WARNING_TIME_MS = 1000, BASE_LASER_FIRE_DURATION_MS = 400, BASE_LASER_SPAWN_INTERVAL_MS = 2000, BLINK_PERIOD_MS = 300, FRENZY_WAVE_DELAY_MS = 350;
+
+      const [running, setRunning] = useState(true);
+      const [deathState, setDeathState] = useState('alive'); // 'alive', 'dying', 'dead'
+      const [waveCount, setWaveCount] = useState(0);
+      const [renderTick, setRenderTick] = useState(0);
+      const playerRef = useRef({ x: Math.floor(GRID_COLS / 2), y: Math.floor(GRID_ROWS / 2) });
+      const lastPlayerPosRef = useRef({ x: 0, y: 0 });
+      const lasersRef = useRef([]);
+      const lastTsRef = useRef(0);
+      const spawnTimerRef = useRef(0);
+
+      const isFrenzyWave = (wc) => { if (wc === 0) return false; const remainder = wc % 25; return remainder >= 21 || remainder === 0; };
+      const getWaveTimings = (wc) => { let multiplier = 1.0; if (wc >= 10) multiplier *= 0.9; if (wc >= 25) multiplier *= 0.95; if (wc >= 50) multiplier *= 0.9; if (wc >= 75) multiplier *= 0.95; if (wc >= 100) multiplier *= 0.95; let spawnInterval = Math.max(800, BASE_LASER_SPAWN_INTERVAL_MS * multiplier); const warningTime = Math.max(400, BASE_LASER_WARNING_TIME_MS * multiplier); const fireDuration = Math.max(150, BASE_LASER_FIRE_DURATION_MS * multiplier); if (isFrenzyWave(wc)) { const frenzyFireDuration = fireDuration * 0.5; const totalFrenzySequenceTimeMs = (4 * FRENZY_WAVE_DELAY_MS) + warningTime + frenzyFireDuration; spawnInterval = Math.max(spawnInterval, totalFrenzySequenceTimeMs + 200); } return { spawnInterval: spawnInterval / 1000, warningTime: warningTime, fireDuration: fireDuration }; };
+
+      useEffect(() => { const kd = (e) => { if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "w", "a", "s", "d"].includes(e.key)) { e.preventDefault(); if (running && deathState === 'alive') { const moveIntent = getMoveIntentFromKey(e.key); if (moveIntent.dx !== 0 || moveIntent.dy !== 0) executeMove(moveIntent); } } }; window.addEventListener("keydown", kd); return () => window.removeEventListener("keydown", kd); }, [running, deathState]);
+      
+      useEffect(() => {
+        let raf;
+        const loop = (ts) => {
+          raf = requestAnimationFrame(loop);
+          if (!running || deathState !== 'alive') { lastTsRef.current = ts; return; }
+          if (!lastTsRef.current) lastTsRef.current = ts;
+          const dt = Math.min(0.033, (ts - lastTsRef.current) / 1000); lastTsRef.current = ts;
+          const currentTimings = getWaveTimings(waveCount); const now = performance.now(); spawnTimerRef.current += dt;
+          if (spawnTimerRef.current >= currentTimings.spawnInterval) { spawnTimerRef.current = 0; spawnLaserWave(); }
+          for (let i = lasersRef.current.length - 1; i >= 0; i--) { const laser = lasersRef.current[i]; if (laser.state === 'warning' && now >= laser.fireTime) laser.state = 'firing'; if (laser.state === 'firing' && deathState === 'alive' && checkLaserHit(laser)) { onDeath(); break; } if (now >= laser.endTime) lasersRef.current.splice(i, 1); }
+          setRenderTick((t) => t + 1);
+        };
+        raf = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(raf);
+      }, [running, deathState, waveCount]);
+      
+      const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+      const getMoveIntentFromKey = (key) => { if (key === "ArrowUp" || key === "w") return { dx: 0, dy: -1 }; if (key === "ArrowDown" || key === "s") return { dx: 0, dy: 1 }; if (key === "ArrowLeft" || key === "a") return { dx: -1, dy: 0 }; if (key === "ArrowRight" || key === "d") return { dx: 1, dy: 0 }; return { dx: 0, dy: 0 }; };
+      const executeMove = (moveIntent) => { const { dx, dy } = moveIntent; if (dx === 0 && dy === 0) return; const p = playerRef.current; p.x = clamp(p.x + dx, 0, GRID_COLS - 1); p.y = clamp(p.y + dy, 0, GRID_ROWS - 1); };
+      const onDeath = () => { lastPlayerPosRef.current = { ...playerRef.current }; setDeathState('dying'); };
+      const randomId = () => Math.random().toString(36).slice(2);
+      const checkLaserHit = (laser) => { const p = playerRef.current; return laser.type === 'row' ? p.y === laser.index : p.x === laser.index; };
+
+      const spawnLaserWave = () => {
+          const nextWave = waveCount + 1; setWaveCount(nextWave); const newWaveTimings = getWaveTimings(nextWave); const now = performance.now(); const usedCombos = new Set(); const isFrenzy = isFrenzyWave(nextWave); const laserCount = isFrenzy ? 5 : Math.floor(Math.random() * 4) + 2;
+          for (let i = 0; i < laserCount; i++) {
+            let type, index, combo, tries = 0; do { type = Math.random() < 0.5 ? 'row' : 'col'; const maxIndex = type === 'row' ? GRID_ROWS : GRID_COLS; index = Math.floor(Math.random() * maxIndex); combo = `${type}:${index}`; tries++; } while (usedCombos.has(combo) && tries < 20);
+            if (!usedCombos.has(combo)) {
+              usedCombos.add(combo); const indicatorSide = type === 'col' ? (Math.random() < 0.5 ? 'top' : 'bottom') : (Math.random() < 0.5 ? 'left' : 'right'); const delay = isFrenzy ? i * FRENZY_WAVE_DELAY_MS : 0; const spawnTime = now + delay; const fireTime = spawnTime + newWaveTimings.warningTime; const currentFireDuration = isFrenzy ? newWaveTimings.fireDuration * 0.5 : newWaveTimings.fireDuration; const endTime = fireTime + currentFireDuration;
+              lasersRef.current.push({ id: randomId(), type, index, state: 'warning', spawnTime, fireTime, endTime, indicatorSide });
+            }
+          }
+      };
+      
+      const gridStyle = { width: GRID_COLS * CELL_PX, height: GRID_ROWS * CELL_PX, gridTemplateColumns: `repeat(${GRID_COLS}, ${CELL_PX}px)`, gridTemplateRows: `repeat(${GRID_ROWS}, ${CELL_PX}px)` };
+      const now = performance.now();
+      const blinkOn = (t0) => ((now - t0) % BLINK_PERIOD_MS) < BLINK_PERIOD_MS / 2;
+
+      const edgeIndicatorElements = running ? lasersRef.current.map(laser => { if (laser.state !== 'warning' || now < laser.spawnTime || !blinkOn(laser.spawnTime)) return null; const orangeYellow = '#fb923c'; const indicator = { type: laser.indicatorSide, lane: laser.index, key: `${laser.id}-indicator` }; let style = {}; if (indicator.type === 'top') style = { position: 'absolute', top: '4px', left: `${20 + indicator.lane * CELL_PX + CELL_PX/4}px`, width: `${CELL_PX/2}px`, height: '12px', backgroundColor: orangeYellow, borderRadius: '0 0 6px 6px' }; else if (indicator.type === 'bottom') style = { position: 'absolute', bottom: '4px', left: `${20 + indicator.lane * CELL_PX + CELL_PX/4}px`, width: `${CELL_PX/2}px`, height: '12px', backgroundColor: orangeYellow, borderRadius: '6px 6px 0 0' }; else if (indicator.type === 'left') style = { position: 'absolute', left: '4px', top: `${20 + indicator.lane * CELL_PX + CELL_PX/4}px`, width: '12px', height: `${CELL_PX/2}px`, backgroundColor: orangeYellow, borderRadius: '0 6px 6px 0' }; else if (indicator.type === 'right') style = { position: 'absolute', right: '4px', top: `${20 + indicator.lane * CELL_PX + CELL_PX/4}px`, width: '12px', height: `${CELL_PX/2}px`, backgroundColor: orangeYellow, borderRadius: '6px 0 0 6px' }; return React.createElement('div', { key: indicator.key, style, className: "shadow-lg" }); }).filter(Boolean) : [];
+      const laserElements = (running || deathState === 'dying') ? lasersRef.current.map(laser => { if (laser.state !== 'firing') return null; const baseStyle = { position: 'absolute', zIndex: 20, pointerEvents: 'none' }; const glowColor = 'rgba(251, 146, 60, 0.8)'; const coreColor = 'rgba(255, 255, 255, 0.95)'; if (laser.type === 'row') { baseStyle.top = `${laser.index * CELL_PX}px`; baseStyle.left = '-20px'; baseStyle.width = `${gridStyle.width + 40}px`; baseStyle.height = `${CELL_PX}px`; baseStyle.background = `linear-gradient(to bottom, transparent, ${glowColor} 30%, ${coreColor} 50%, ${glowColor} 70%, transparent)`; } else { baseStyle.left = `${laser.index * CELL_PX}px`; baseStyle.top = '-20px'; baseStyle.height = `${gridStyle.height + 40}px`; baseStyle.width = `${CELL_PX}px`; baseStyle.background = `linear-gradient(to right, transparent, ${glowColor} 30%, ${coreColor} 50%, ${glowColor} 70%, transparent)`; } return React.createElement('div', { key: laser.id, style: baseStyle }); }).filter(Boolean) : [];
+      const intersectionElements = []; if (running || deathState === 'dying') { const firingRows = new Set(), firingCols = new Set(); lasersRef.current.forEach(laser => { if (laser.state === 'firing') { if (laser.type === 'row') firingRows.add(laser.index); else firingCols.add(laser.index); } }); firingRows.forEach(r => { firingCols.forEach(c => { const style = { position: 'absolute', top: `${r * CELL_PX}px`, left: `${c * CELL_PX}px`, width: `${CELL_PX}px`, height: `${CELL_PX}px`, zIndex: 21, pointerEvents: 'none', background: `radial-gradient(circle at center, rgba(255, 255, 255, 1) 0%, rgba(251, 146, 60, 0.9) 40%, transparent 70%)` }; intersectionElements.push(React.createElement('div', { key: `intersect-${r}-${c}`, style })); }); }); }
+      const playerElement = (running && deathState === 'alive') && React.createElement('div', { style: { position: 'absolute', left: `${playerRef.current.x * CELL_PX}px`, top: `${playerRef.current.y * CELL_PX}px`, width: `${CELL_PX}px`, height: `${CELL_PX}px`, zIndex: 10, transition: 'left 100ms linear, top 100ms linear' } }, React.createElement(StickFigure, { className: "w-full h-full text-black" }));
+
+      return React.createElement('div', null, 
+        React.createElement('header', { className: "mb-4 flex items-center justify-center w-full", style: { maxWidth: gridStyle.width + 40 } }, 
+          React.createElement('h1', { className: "text-2xl md:text-3xl font-bold tracking-tight" }, "Mr.Oops!! - Laser")
+        ),
+        React.createElement('div', { className: "relative rounded-2xl overflow-hidden shadow-xl border border-slate-800", style: { width: gridStyle.width + 40, height: gridStyle.height + 40, padding: '20px' } },
+          ...edgeIndicatorElements,
+          React.createElement('div', { className: "absolute inset-5 grid", style: gridStyle }, [...Array(GRID_ROWS * GRID_COLS)].map((_, i) => React.createElement('div', { key: `cell-${i}`, className: `border border-gray-300 bg-white`, style: { width: CELL_PX, height: CELL_PX } }))),
+          React.createElement('div', { className: "absolute", style: { top: '20px', left: '20px', width: gridStyle.width, height: gridStyle.height, pointerEvents: 'none' } },
+            playerElement, ...laserElements, ...intersectionElements,
+            deathState === 'dying' && React.createElement(DeathAnimation, { playerPos: lastPlayerPosRef.current, cellPx: CELL_PX, onAnimationEnd: () => onGameOver(waveCount) })
+          )
+        )
+      );
+    }
+    
+    // ===== NEW: Level Transition Component =====
+    function LevelTransition({ levelName, onComplete }) {
+        useEffect(() => {
+            const timer = setTimeout(() => {
+                onComplete();
+            }, 3000);
+            return () => clearTimeout(timer);
+        }, [onComplete]);
+
+        const animationCss = `
+            @keyframes fadeInOut {
+                0% { opacity: 0; transform: scale(0.95); }
+                20% { opacity: 0.9; transform: scale(1.02); }
+                80% { opacity: 0.9; transform: scale(1.02); }
+                100% { opacity: 0; transform: scale(0.95); }
+            }
+        `;
+
+        return React.createElement(React.Fragment, null,
+            React.createElement('style', null, animationCss),
+            React.createElement('div', {
+                className: "flex items-center justify-center w-full h-full",
+                style: {
+                    animation: `fadeInOut 3s ease-in-out forwards`,
+                    height: "580px" // Same as game board height
+                }
+            },
+                React.createElement('h2', {
+                    className: "text-6xl font-bold text-orange-400 tracking-wider"
+                }, levelName)
+            )
+        );
+    }
+
+    // ===== GAME MANAGER =====
+    function GameManager() {
+      // Add PRE-states for transitions
+      const [level, setLevel] = useState('INTRO'); // INTRO, PRE_ROCK, ROCK, PRE_IRON, IRON, PRE_LASER, LASER, RESULTS
+      const [scores, setScores] = useState({ rock: null, iron: null, laser: null });
+
+      const handleRockComplete = (waveCount) => {
+        setScores(s => ({ ...s, rock: waveCount }));
+        setLevel('PRE_IRON'); // Go to Iron transition
+      };
+
+      const handleIronComplete = (waveCount) => {
+        setScores(s => ({ ...s, iron: waveCount }));
+        setLevel('PRE_LASER'); // Go to Laser transition
+      };
+
+      const handleLaserComplete = (waveCount) => {
+        setScores(s => ({ ...s, laser: waveCount }));
+        setLevel('RESULTS');
+      };
+
+      const handleRestart = () => {
+        setScores({ rock: null, iron: null, laser: null });
+        setLevel('INTRO');
+      };
+      
+      const renderContent = () => {
+        switch (level) {
+          case 'INTRO':
+            return React.createElement(GameOverlay, null, 
+              React.createElement('div', { className: "text-center space-y-6" },
+                React.createElement('h1', { className: "text-5xl font-bold tracking-tighter" }, "Mr.Oops!!"),
+                React.createElement('p', {className: "text-slate-300"}, "你能存活多久？"),
+                // Go to Rock transition on start
+                React.createElement('button', { onClick: () => setLevel('PRE_ROCK'), className: "px-6 py-3 rounded-2xl bg-blue-500 hover:bg-blue-400 text-slate-950 font-bold text-lg shadow-lg" }, "開始挑戰")
+              )
+            );
+          // Handle new PRE states
+          case 'PRE_ROCK':
+            return React.createElement(LevelTransition, { levelName: 'Rock', onComplete: () => setLevel('ROCK') });
+          case 'ROCK':
+            return React.createElement(RockGame, { key: 'rock', onGameOver: handleRockComplete });
+          
+          case 'PRE_IRON':
+            return React.createElement(LevelTransition, { levelName: 'Iron', onComplete: () => setLevel('IRON') });
+          case 'IRON':
+            return React.createElement(IronGame, { key: 'iron', onGameOver: handleIronComplete });
+
+          case 'PRE_LASER':
+            return React.createElement(LevelTransition, { levelName: 'Laser', onComplete: () => setLevel('LASER') });
+          case 'LASER':
+            return React.createElement(LaserGame, { key: 'laser', onGameOver: handleLaserComplete });
+
+          case 'RESULTS':
+            const { rock, iron, laser } = scores;
+            const finalScore = (rock || 1) * (iron || 1) * (laser || 1);
+            return React.createElement(GameOverlay, null, 
+              React.createElement('div', { className: "text-center space-y-5" },
+                React.createElement('h2', { className: "text-3xl font-bold" }, "遊戲結束!"),
+                React.createElement('div', {className: "space-y-3 text-lg text-left bg-slate-800/50 p-4 rounded-xl"},
+                  React.createElement('p', null, `🪨 Rock Wave: `, React.createElement('span', {className: "font-semibold text-amber-400"}, rock)),
+                  React.createElement('p', null, `🔩 Iron Wave: `, React.createElement('span', {className: "font-semibold text-sky-400"}, iron)),
+                  React.createElement('p', null, `⚡️ Laser Wave: `, React.createElement('span', {className: "font-semibold text-fuchsia-400"}, laser))
+                ),
+                React.createElement('div', {className: "pt-2"},
+                    React.createElement('p', {className: "text-slate-300 text-base"}, "最終分數"),
+                    React.createElement('p', { className: "text-4xl font-bold text-yellow-400 tracking-wider" }, finalScore.toLocaleString())
+                ),
+                React.createElement('button', { onClick: handleRestart, className: "mt-4 px-6 py-3 rounded-2xl bg-blue-500 hover:bg-blue-400 text-slate-950 font-bold text-lg shadow-lg" }, "再玩一次")
+              )
+            );
+          default:
+            return React.createElement('div', null, 'Loading...');
+        }
+      };
+
+      return React.createElement('div', {
+        className: "min-h-screen w-full bg-slate-950 text-slate-100 flex items-center justify-center p-6 select-none"
+      }, 
+        React.createElement('div', { className: "w-full max-w-4xl flex flex-col items-center" }, 
+          renderContent()
+        )
+      );
+    }
+
+    ReactDOM.render(React.createElement(GameManager), document.getElementById('root'));
+  </script>
+</body>
+</html>
